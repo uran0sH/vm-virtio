@@ -12,7 +12,9 @@ use vm_memory::{
 };
 
 use crate::defs::{VIRTQ_AVAIL_ELEMENT_SIZE, VIRTQ_AVAIL_RING_HEADER_SIZE};
-use crate::{Descriptor, DescriptorChain, Error, Queue, QueueOwnedT, QueueT, VirtqUsedElem};
+use crate::{
+    split_descriptor::Descriptor, DescriptorChain, Error, Queue, QueueOwnedT, QueueT, VirtqUsedElem,
+};
 use std::fmt::{self, Debug, Display};
 use virtio_bindings::bindings::virtio_ring::{VRING_DESC_F_INDIRECT, VRING_DESC_F_NEXT};
 

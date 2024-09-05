@@ -23,10 +23,11 @@ use log::error;
 use vm_memory::{GuestMemory, GuestMemoryError, VolatileMemoryError};
 
 pub use self::chain::{DescriptorChain, DescriptorChainRwIter};
-pub use self::descriptor::{Descriptor, VirtqUsedElem};
+pub use self::descriptor::Descriptor;
 pub use self::descriptor_utils::{Reader, Writer};
 pub use self::queue::{AvailIter, Queue};
 pub use self::queue_sync::QueueSync;
+pub use self::split_descriptor::VirtqUsedElem;
 pub use self::state::QueueState;
 
 pub mod defs;
@@ -36,8 +37,10 @@ pub mod mock;
 mod chain;
 mod descriptor;
 mod descriptor_utils;
+mod packed_descriptor;
 mod queue;
 mod queue_sync;
+mod split_descriptor;
 mod state;
 
 /// Virtio Queue related errors.
@@ -144,6 +147,9 @@ pub trait QueueT: for<'a> QueueGuard<'a> {
     fn new(max_size: u16) -> Result<Self, Error>
     where
         Self: Sized;
+
+    /// Set if a packed virtqueue.
+    fn set_packed(&mut self, packed: bool);
 
     /// Check whether the queue configuration is valid.
     fn is_valid<M: GuestMemory>(&self, mem: &M) -> bool;

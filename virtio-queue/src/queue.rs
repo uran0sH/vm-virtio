@@ -12,6 +12,10 @@ use std::num::Wrapping;
 use std::ops::Deref;
 use std::sync::atomic::{fence, Ordering};
 
+use virtio_bindings::virtio_ring::{
+    VRING_PACKED_DESC_F_AVAIL, VRING_PACKED_DESC_F_USED, VRING_PACKED_EVENT_FLAG_DESC,
+    VRING_PACKED_EVENT_FLAG_DISABLE, VRING_PACKED_EVENT_FLAG_ENABLE,
+};
 use vm_memory::{Address, Bytes, GuestAddress, GuestMemory};
 
 use crate::defs::{
@@ -19,9 +23,10 @@ use crate::defs::{
     VIRTQ_AVAIL_ELEMENT_SIZE, VIRTQ_AVAIL_RING_HEADER_SIZE, VIRTQ_AVAIL_RING_META_SIZE,
     VIRTQ_USED_ELEMENT_SIZE, VIRTQ_USED_RING_HEADER_SIZE, VIRTQ_USED_RING_META_SIZE,
 };
+use crate::descriptor::PackedDescEvent;
 use crate::{
-    error, Descriptor, DescriptorChain, Error, QueueGuard, QueueOwnedT, QueueState, QueueT,
-    VirtqUsedElem,
+    error, packed_descriptor, Descriptor, DescriptorChain, Error, QueueGuard, QueueOwnedT,
+    QueueState, QueueT, VirtqUsedElem,
 };
 use virtio_bindings::bindings::virtio_ring::VRING_USED_F_NO_NOTIFY;
 
@@ -100,6 +105,11 @@ pub struct Queue {
     /// Indicates if the queue is finished with configuration.
     ready: bool,
 
+    last_avail_wrap_counter: bool,
+
+    // shadow_avail_wrap_counter: bool,
+    used_wrap_counter: bool,
+
     /// Guest physical address of the descriptor table.
     desc_table: GuestAddress,
 
@@ -108,6 +118,9 @@ pub struct Queue {
 
     /// Guest physical address of the used ring.
     used_ring: GuestAddress,
+
+    /// Indicates if the queue is packed.
+    packed: bool,
 }
 
 impl Queue {
@@ -225,7 +238,11 @@ impl Queue {
     //
     // Every access in this method uses `Relaxed` ordering because a fence is added by the caller
     // when appropriate.
-    fn set_notification<M: GuestMemory>(&mut self, mem: &M, enable: bool) -> Result<(), Error> {
+    fn set_split_notification<M: GuestMemory>(
+        &mut self,
+        mem: &M,
+        enable: bool,
+    ) -> Result<(), Error> {
         if enable {
             if self.event_idx_enabled {
                 // We call `set_avail_event` using the `next_avail` value, instead of reading
@@ -241,6 +258,38 @@ impl Queue {
             // Notifications are effectively disabled by default after triggering once when
             // `VIRTIO_F_EVENT_IDX` is negotiated, so we don't do anything in that case.
             Ok(())
+        }
+    }
+
+    fn set_packed_notification<M: GuestMemory>(
+        &mut self,
+        mem: &M,
+        enable: bool,
+    ) -> Result<(), Error> {
+        let addr = self.used_ring;
+        let mut event = mem
+            .read_obj::<PackedDescEvent>(addr)
+            .map_err(Error::GuestMemory)?;
+        if enable {
+            if self.event_idx_enabled {
+                event.set_off_wrap(
+                    ((self.last_avail_wrap_counter as u16) << 15) | self.next_avail.0,
+                );
+                event.set_flags(VRING_PACKED_EVENT_FLAG_DESC as u16);
+            } else {
+                event.set_flags(VRING_PACKED_EVENT_FLAG_ENABLE as u16);
+            }
+        } else {
+            event.set_flags(VRING_PACKED_EVENT_FLAG_DISABLE as u16);
+        }
+        mem.write_obj(event, addr).map_err(Error::GuestMemory)
+    }
+
+    fn set_notification<M: GuestMemory>(&mut self, mem: &M, enable: bool) -> Result<(), Error> {
+        if self.packed {
+            self.set_packed_notification(mem, enable)
+        } else {
+            self.set_split_notification(mem, enable)
         }
     }
 
@@ -269,6 +318,74 @@ impl Queue {
             .map(Wrapping)
             .map_err(Error::GuestMemory)
     }
+
+    fn add_split_used<M: GuestMemory>(
+        &mut self,
+        mem: &M,
+        head_index: u16,
+        len: u32,
+    ) -> Result<(), Error> {
+        if head_index >= self.size {
+            error!(
+                "attempted to add out of bounds descriptor to used ring: {}",
+                head_index
+            );
+            return Err(Error::InvalidDescriptorIndex);
+        }
+
+        let next_used_index = u64::from(self.next_used.0 % self.size);
+        // This can not overflow an u64 since it is working with relatively small numbers compared
+        // to u64::MAX.
+        let offset = VIRTQ_USED_RING_HEADER_SIZE + next_used_index * VIRTQ_USED_ELEMENT_SIZE;
+        let addr = self
+            .used_ring
+            .checked_add(offset)
+            .ok_or(Error::AddressOverflow)?;
+        mem.write_obj(VirtqUsedElem::new(head_index.into(), len), addr)
+            .map_err(Error::GuestMemory)?;
+
+        self.next_used += Wrapping(1);
+        self.num_added += Wrapping(1);
+
+        mem.store(
+            u16::to_le(self.next_used.0),
+            self.used_ring
+                .checked_add(2)
+                .ok_or(Error::AddressOverflow)?,
+            Ordering::Release,
+        )
+        .map_err(Error::GuestMemory)
+    }
+
+    fn add_packed_used<M: GuestMemory>(
+        &mut self,
+        mem: &M,
+        head_index: u16,
+        len: u32,
+    ) -> Result<(), Error> {
+        let mut desc = packed_descriptor::Descriptor::new(0, len, head_index, 0);
+        let mut idx = self.next_used + Wrapping(head_index);
+        if idx.0 >= self.size {
+            idx -= Wrapping(self.size);
+            self.used_wrap_counter ^= true;
+        }
+        let mut flags = desc.flags();
+        let wrapper = self.used_wrap_counter;
+        if wrapper {
+            flags |= 1 << VRING_PACKED_DESC_F_USED;
+            flags |= 1 << VRING_PACKED_DESC_F_AVAIL;
+        } else {
+            flags &= !(1 << VRING_PACKED_DESC_F_USED);
+            flags &= !(1 << VRING_PACKED_DESC_F_AVAIL);
+        }
+        desc.set_flags(flags);
+
+        let addr = self
+            .desc_table
+            .checked_add((idx.0 as usize * size_of::<packed_descriptor::Descriptor>()) as u64)
+            .ok_or(Error::AddressOverflow)?;
+        mem.write_obj(desc, addr).map_err(Error::GuestMemory)
+    }
 }
 
 impl<'a> QueueGuard<'a> for Queue {
@@ -293,7 +410,12 @@ impl QueueT for Queue {
             next_used: Wrapping(0),
             event_idx_enabled: false,
             num_added: Wrapping(0),
+            ..Default::default()
         })
+    }
+
+    fn set_packed(&mut self, packed: bool) {
+        self.packed = packed;
     }
 
     fn is_valid<M: GuestMemory>(&self, mem: &M) -> bool {
@@ -302,13 +424,6 @@ impl QueueT for Queue {
         // The multiplication can not overflow an u64 since we are multiplying an u16 with a
         // small number.
         let desc_table_size = size_of::<Descriptor>() as u64 * queue_size;
-        let avail_ring = self.avail_ring;
-        // The operations below can not overflow an u64 since they're working with relatively small
-        // numbers compared to u64::MAX.
-        let avail_ring_size = VIRTQ_AVAIL_RING_META_SIZE + VIRTQ_AVAIL_ELEMENT_SIZE * queue_size;
-        let used_ring = self.used_ring;
-        let used_ring_size = VIRTQ_USED_RING_META_SIZE + VIRTQ_USED_ELEMENT_SIZE * queue_size;
-
         if !self.ready {
             error!("attempt to use virtio queue that is not marked ready");
             false
@@ -322,26 +437,38 @@ impl QueueT for Queue {
                 desc_table_size
             );
             false
-        } else if avail_ring
-            .checked_add(avail_ring_size)
-            .map_or(true, |v| !mem.address_in_range(v))
-        {
-            error!(
-                "virtio queue available ring goes out of bounds: start:0x{:08x} size:0x{:08x}",
-                avail_ring.raw_value(),
-                avail_ring_size
-            );
-            false
-        } else if used_ring
-            .checked_add(used_ring_size)
-            .map_or(true, |v| !mem.address_in_range(v))
-        {
-            error!(
-                "virtio queue used ring goes out of bounds: start:0x{:08x} size:0x{:08x}",
-                used_ring.raw_value(),
-                used_ring_size
-            );
-            false
+        } else if !self.packed {
+            let avail_ring = self.avail_ring;
+            // The operations below can not overflow an u64 since they're working with relatively small
+            // numbers compared to u64::MAX.
+            let avail_ring_size =
+                VIRTQ_AVAIL_RING_META_SIZE + VIRTQ_AVAIL_ELEMENT_SIZE * queue_size;
+            let used_ring = self.used_ring;
+            let used_ring_size = VIRTQ_USED_RING_META_SIZE + VIRTQ_USED_ELEMENT_SIZE * queue_size;
+
+            if avail_ring
+                .checked_add(avail_ring_size)
+                .map_or(true, |v| !mem.address_in_range(v))
+            {
+                error!(
+                    "virtio queue available ring goes out of bounds: start:0x{:08x} size:0x{:08x}",
+                    avail_ring.raw_value(),
+                    avail_ring_size
+                );
+                false
+            } else if used_ring
+                .checked_add(used_ring_size)
+                .map_or(true, |v| !mem.address_in_range(v))
+            {
+                error!(
+                    "virtio queue used ring goes out of bounds: start:0x{:08x} size:0x{:08x}",
+                    used_ring.raw_value(),
+                    used_ring_size
+                );
+                false
+            } else {
+                true
+            }
         } else {
             true
         }
@@ -452,36 +579,11 @@ impl QueueT for Queue {
         head_index: u16,
         len: u32,
     ) -> Result<(), Error> {
-        if head_index >= self.size {
-            error!(
-                "attempted to add out of bounds descriptor to used ring: {}",
-                head_index
-            );
-            return Err(Error::InvalidDescriptorIndex);
+        if self.packed {
+            self.add_packed_used(mem, head_index, len)
+        } else {
+            self.add_split_used(mem, head_index, len)
         }
-
-        let next_used_index = u64::from(self.next_used.0 % self.size);
-        // This can not overflow an u64 since it is working with relatively small numbers compared
-        // to u64::MAX.
-        let offset = VIRTQ_USED_RING_HEADER_SIZE + next_used_index * VIRTQ_USED_ELEMENT_SIZE;
-        let addr = self
-            .used_ring
-            .checked_add(offset)
-            .ok_or(Error::AddressOverflow)?;
-        mem.write_obj(VirtqUsedElem::new(head_index.into(), len), addr)
-            .map_err(Error::GuestMemory)?;
-
-        self.next_used += Wrapping(1);
-        self.num_added += Wrapping(1);
-
-        mem.store(
-            u16::to_le(self.next_used.0),
-            self.used_ring
-                .checked_add(2)
-                .ok_or(Error::AddressOverflow)?,
-            Ordering::Release,
-        )
-        .map_err(Error::GuestMemory)
     }
 
     // TODO: Turn this into a doc comment/example.
@@ -524,37 +626,60 @@ impl QueueT for Queue {
     }
 
     fn needs_notification<M: GuestMemory>(&mut self, mem: &M) -> Result<bool, Error> {
-        let used_idx = self.next_used;
-
-        // Complete all the writes in add_used() before reading the event.
-        fence(Ordering::SeqCst);
-
-        // The VRING_AVAIL_F_NO_INTERRUPT flag isn't supported yet.
-
-        // When the `EVENT_IDX` feature is negotiated, the driver writes into `used_event`
-        // a value that's used by the device to determine whether a notification must
-        // be submitted after adding a descriptor chain to the used ring. According to the
-        // standard, the notification must be sent when `next_used == used_event + 1`, but
-        // various device model implementations rely on an inequality instead, most likely
-        // to also support use cases where a bunch of descriptor chains are added to the used
-        // ring first, and only afterwards the `needs_notification` logic is called. For example,
-        // the approach based on `num_added` below is taken from the Linux Kernel implementation
-        // (i.e. https://elixir.bootlin.com/linux/v5.15.35/source/drivers/virtio/virtio_ring.c#L661)
-
-        // The `old` variable below is used to determine the value of `next_used` from when
-        // `needs_notification` was called last (each `needs_notification` call resets `num_added`
-        // to zero, while each `add_used` called increments it by one). Then, the logic below
-        // uses wrapped arithmetic to see whether `used_event` can be found between `old` and
-        // `next_used` in the circular sequence space of the used ring.
-        if self.event_idx_enabled {
-            let used_event = self.used_event(mem, Ordering::Relaxed)?;
+        if self.packed {
+            let addr = self.avail_ring;
+            let e = mem
+                .read_obj::<PackedDescEvent>(addr)
+                .map_err(Error::GuestMemory)?;
+            if e.get_flags() == VRING_PACKED_EVENT_FLAG_DISABLE as u16 {
+                return Ok(false);
+            } else if e.get_flags() == VRING_PACKED_EVENT_FLAG_ENABLE as u16 {
+                return Ok(true);
+            }
+            let used_idx = self.next_used;
             let old = used_idx - self.num_added;
-            self.num_added = Wrapping(0);
+            
+            // Complete all the writes in add_used() before reading the event.
+            fence(Ordering::SeqCst);
+            let mut off = e.get_off_wrap() & 0x7fff; // ~(1 << 15)
+            if self.used_wrap_counter != (e.get_off_wrap() >> 15 != 0) {
+                off -= self.size;
+            }
 
-            return Ok(used_idx - used_event - Wrapping(1) < used_idx - old);
+            return Ok(used_idx - Wrapping(off) - Wrapping(1) < used_idx - old);
+        } else {
+            let used_idx = self.next_used;
+
+            // Complete all the writes in add_used() before reading the event.
+            fence(Ordering::SeqCst);
+
+            // The VRING_AVAIL_F_NO_INTERRUPT flag isn't supported yet.
+
+            // When the `EVENT_IDX` feature is negotiated, the driver writes into `used_event`
+            // a value that's used by the device to determine whether a notification must
+            // be submitted after adding a descriptor chain to the used ring. According to the
+            // standard, the notification must be sent when `next_used == used_event + 1`, but
+            // various device model implementations rely on an inequality instead, most likely
+            // to also support use cases where a bunch of descriptor chains are added to the used
+            // ring first, and only afterwards the `needs_notification` logic is called. For example,
+            // the approach based on `num_added` below is taken from the Linux Kernel implementation
+            // (i.e. https://elixir.bootlin.com/linux/v5.15.35/source/drivers/virtio/virtio_ring.c#L661)
+
+            // The `old` variable below is used to determine the value of `next_used` from when
+            // `needs_notification` was called last (each `needs_notification` call resets `num_added`
+            // to zero, while each `add_used` called increments it by one). Then, the logic below
+            // uses wrapped arithmetic to see whether `used_event` can be found between `old` and
+            // `next_used` in the circular sequence space of the used ring.
+            if self.event_idx_enabled {
+                let used_event = self.used_event(mem, Ordering::Relaxed)?;
+                let old = used_idx - self.num_added;
+                self.num_added = Wrapping(0);
+
+                return Ok(used_idx - used_event - Wrapping(1) < used_idx - old);
+            }
+
+            Ok(true)
         }
-
-        Ok(true)
     }
 
     fn next_avail(&self) -> u16 {
@@ -614,12 +739,16 @@ impl QueueOwnedT for Queue {
         // We're checking here that a reset did not happen without re-initializing the queue.
         // TODO: In the future we might want to also check that the other parameters in the
         // queue are valid.
-        if !self.ready || self.avail_ring == GuestAddress(0) {
+        if !self.ready || (!self.packed && self.avail_ring == GuestAddress(0)) {
             return Err(Error::QueueNotReady);
         }
 
-        self.avail_idx(mem.deref(), Ordering::Acquire)
-            .map(move |idx| AvailIter::new(mem, idx, self))?
+        if self.packed {
+            self.avail_idx(mem.deref(), Ordering::Acquire)
+                .map(move |idx| AvailIter::new(mem, idx, self))?
+        } else {
+            AvailIter::new(mem, Wrapping(self.size), self)
+        }
     }
 
     fn go_to_previous_position(&mut self) {
@@ -701,7 +830,9 @@ pub struct AvailIter<'b, M> {
     avail_ring: GuestAddress,
     queue_size: u16,
     last_index: Wrapping<u16>,
+    wrap_counter: &'b mut bool,
     next_avail: &'b mut Wrapping<u16>,
+    is_packed: bool,
 }
 
 impl<'b, M> AvailIter<'b, M>
@@ -734,7 +865,9 @@ where
             avail_ring: queue.avail_ring,
             queue_size: queue.size,
             last_index: idx,
+            wrap_counter: &mut queue.last_avail_wrap_counter,
             next_avail: &mut queue.next_avail,
+            is_packed: queue.packed,
         })
     }
 
@@ -748,6 +881,12 @@ where
     pub fn go_to_previous_position(&mut self) {
         *self.next_avail -= Wrapping(1);
     }
+
+    fn is_desc_avail(&self, flags: u16) -> bool {
+        let avail = !!(flags & (1 << VRING_PACKED_DESC_F_AVAIL));
+        let used = !!(flags & (1 << VRING_PACKED_DESC_F_USED));
+        return (avail != used) && (avail == *self.wrap_counter as u16);
+    }
 }
 
 impl<'b, M> Iterator for AvailIter<'b, M>
@@ -758,32 +897,66 @@ where
     type Item = DescriptorChain<M>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if *self.next_avail == self.last_index {
-            return None;
+        if !self.is_packed {
+            if *self.next_avail == self.last_index {
+                return None;
+            }
+            // These two operations can not overflow an u64 since they're working with relatively small
+            // numbers compared to u64::MAX.
+            let elem_off = u64::from(self.next_avail.0.checked_rem(self.queue_size)?)
+                * VIRTQ_AVAIL_ELEMENT_SIZE;
+            let offset = VIRTQ_AVAIL_RING_HEADER_SIZE + elem_off;
+            let addr = self.avail_ring.checked_add(offset)?;
+            let head_index: u16 = self
+                .mem
+                .load(addr, Ordering::Acquire)
+                .map(u16::from_le)
+                .map_err(|_| error!("Failed to read from memory {:x}", addr.raw_value()))
+                .ok()?;
+
+            *self.next_avail += Wrapping(1);
+
+            Some(DescriptorChain::new(
+                self.mem.clone(),
+                self.desc_table,
+                self.queue_size,
+                head_index,
+                false,
+            ))
+        } else {
+            // find the next avail descriptor
+            let idx = *self.next_avail;
+            // let wrap_counter = self.last_avail_wrap_counter;
+            let offset = u64::from(idx.0.checked_rem(self.queue_size)?)
+                * size_of::<Descriptor>() as u64
+                + 14;
+
+            let addr = self.desc_table.checked_add(offset)?;
+            let flags = self
+                .mem
+                .load(addr, Ordering::Acquire)
+                .map(u16::from_le)
+                .map_err(|_| error!("Failed to read from memory {:x}", addr.raw_value()))
+                .ok()?;
+            if !self.is_desc_avail(flags) {
+                return None;
+            }
+
+            *self.next_avail += Wrapping(1);
+
+            if *self.next_avail >= Wrapping(self.queue_size) {
+                *self.next_avail -= Wrapping(self.queue_size);
+                *self.wrap_counter ^= true;
+            }
+
+            Some(DescriptorChain::new(
+                self.mem.clone(),
+                self.desc_table,
+                self.queue_size,
+                idx.0,
+                true,
+            ))
         }
-
-        // These two operations can not overflow an u64 since they're working with relatively small
-        // numbers compared to u64::MAX.
-        let elem_off =
-            u64::from(self.next_avail.0.checked_rem(self.queue_size)?) * VIRTQ_AVAIL_ELEMENT_SIZE;
-        let offset = VIRTQ_AVAIL_RING_HEADER_SIZE + elem_off;
-
-        let addr = self.avail_ring.checked_add(offset)?;
-        let head_index: u16 = self
-            .mem
-            .load(addr, Ordering::Acquire)
-            .map(u16::from_le)
-            .map_err(|_| error!("Failed to read from memory {:x}", addr.raw_value()))
-            .ok()?;
-
-        *self.next_avail += Wrapping(1);
-
-        Some(DescriptorChain::new(
-            self.mem.clone(),
-            self.desc_table,
-            self.queue_size,
-            head_index,
-        ))
     }
 }
 
@@ -801,7 +974,7 @@ mod tests {
     use super::*;
     use crate::defs::{DEFAULT_AVAIL_RING_ADDR, DEFAULT_DESC_TABLE_ADDR, DEFAULT_USED_RING_ADDR};
     use crate::mock::MockSplitQueue;
-    use crate::Descriptor;
+    use crate::split_descriptor::Descriptor;
     use virtio_bindings::bindings::virtio_ring::{
         VRING_DESC_F_NEXT, VRING_DESC_F_WRITE, VRING_USED_F_NO_NOTIFY,
     };
@@ -1506,6 +1679,7 @@ mod tests {
             desc_table: GuestAddress(12837708984796196),
             avail_ring: GuestAddress(0),
             used_ring: GuestAddress(9943947977301164032),
+            ..Default::default()
         };
 
         assert!(q.pop_descriptor_chain(m).is_none());

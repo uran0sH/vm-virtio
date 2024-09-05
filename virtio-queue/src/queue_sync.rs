@@ -60,6 +60,10 @@ impl QueueT for QueueSync {
         })
     }
 
+    fn set_packed(&mut self, packed: bool) {
+        self.lock_state().set_packed(packed)
+    }
+
     fn is_valid<M: GuestMemory>(&self, mem: &M) -> bool {
         self.lock_state().is_valid(mem)
     }

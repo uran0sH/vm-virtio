@@ -31,6 +31,7 @@ pub struct DescriptorChain<M> {
     ttl: u16,
     yielded_bytes: u32,
     is_indirect: bool,
+    is_packed: bool,
 }
 
 impl<M> DescriptorChain<M>
@@ -44,6 +45,7 @@ where
         queue_size: u16,
         ttl: u16,
         head_index: u16,
+        is_packed: bool,
     ) -> Self {
         DescriptorChain {
             mem,
@@ -54,6 +56,7 @@ where
             ttl,
             is_indirect: false,
             yielded_bytes: 0,
+            is_packed,
         }
     }
 
@@ -66,8 +69,16 @@ where
     /// * `queue_size` - the size of the queue, which is also the maximum size of a descriptor
     ///                  chain.
     /// * `head_index` - the descriptor index of the chain head.
-    pub(crate) fn new(mem: M, desc_table: GuestAddress, queue_size: u16, head_index: u16) -> Self {
-        Self::with_ttl(mem, desc_table, queue_size, queue_size, head_index)
+    pub(crate) fn new(
+        mem: M,
+        desc_table: GuestAddress,
+        queue_size: u16,
+        head_index: u16,
+        is_packed: bool,
+    ) -> Self {
+        Self::with_ttl(
+            mem, desc_table, queue_size, queue_size, head_index, is_packed,
+        )
     }
 
     /// Get the descriptor index of the chain head.
@@ -191,7 +202,14 @@ where
         };
 
         if desc.has_next() {
-            self.next_index = desc.next();
+            if self.is_packed {
+                self.next_index += 1;
+                if self.next_index >= self.queue_size {
+                    self.next_index -= self.queue_size;
+                }
+            } else {
+                self.next_index = desc.next();
+            }
             // It's ok to decrement `self.ttl` here because we check at the start of the method
             // that it's greater than 0.
             self.ttl -= 1;
@@ -259,6 +277,7 @@ mod tests {
 
     #[test]
     fn test_checked_new_descriptor_chain() {
+        use crate::split_descriptor::Descriptor;
         let m = &GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
         let vq = MockSplitQueue::new(m, 16);
 
@@ -266,17 +285,21 @@ mod tests {
 
         // index >= queue_size
         assert!(
-            DescriptorChain::<&GuestMemoryMmap>::new(m, vq.start(), 16, 16)
+            DescriptorChain::<&GuestMemoryMmap>::new(m, vq.start(), 16, 16, false)
                 .next()
                 .is_none()
         );
 
         // desc_table address is way off
-        assert!(
-            DescriptorChain::<&GuestMemoryMmap>::new(m, GuestAddress(0x00ff_ffff_ffff), 16, 0)
-                .next()
-                .is_none()
-        );
+        assert!(DescriptorChain::<&GuestMemoryMmap>::new(
+            m,
+            GuestAddress(0x00ff_ffff_ffff),
+            16,
+            0,
+            false
+        )
+        .next()
+        .is_none());
 
         {
             // the first desc has a normal len, and the next_descriptor flag is set
@@ -284,7 +307,7 @@ mod tests {
             let desc = Descriptor::new(0x1000, 0x1000, VRING_DESC_F_NEXT as u16, 16);
             vq.desc_table().store(0, desc).unwrap();
 
-            let mut c = DescriptorChain::<&GuestMemoryMmap>::new(m, vq.start(), 16, 0);
+            let mut c = DescriptorChain::<&GuestMemoryMmap>::new(m, vq.start(), 16, 0, false);
             c.next().unwrap();
             assert!(c.next().is_none());
         }
@@ -297,7 +320,7 @@ mod tests {
             let desc = Descriptor::new(0x2000, 0x1000, 0, 0);
             vq.desc_table().store(1, desc).unwrap();
 
-            let mut c = DescriptorChain::<&GuestMemoryMmap>::new(m, vq.start(), 16, 0);
+            let mut c = DescriptorChain::<&GuestMemoryMmap>::new(m, vq.start(), 16, 0, false);
 
             assert_eq!(
                 c.memory() as *const GuestMemoryMmap,
@@ -325,6 +348,7 @@ mod tests {
 
     #[test]
     fn test_ttl_wrap_around() {
+        use crate::split_descriptor::Descriptor;
         const QUEUE_SIZE: u16 = 16;
 
         let m = &GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 0x100000)]).unwrap();
@@ -344,7 +368,7 @@ mod tests {
         let desc = Descriptor::new((0x1000 * 16) as u64, 0x1000, 0, 0);
         vq.desc_table().store(QUEUE_SIZE - 1, desc).unwrap();
 
-        let mut c = DescriptorChain::<&GuestMemoryMmap>::new(m, vq.start(), QUEUE_SIZE, 0);
+        let mut c = DescriptorChain::<&GuestMemoryMmap>::new(m, vq.start(), QUEUE_SIZE, 0, false);
         assert_eq!(c.ttl, c.queue_size);
 
         // Validate that `ttl` wraps around even when the entire descriptor table is populated.
@@ -357,6 +381,7 @@ mod tests {
 
     #[test]
     fn test_new_from_indirect_descriptor() {
+        use crate::split_descriptor::Descriptor;
         // This is testing that chaining an indirect table works as expected. It is also a negative
         // test for the following requirement from the spec:
         // `A driver MUST NOT set both VIRTQ_DESC_F_INDIRECT and VIRTQ_DESC_F_NEXT in flags.`. In
@@ -380,7 +405,8 @@ mod tests {
         let desc = Descriptor::new(0x8000, 0x1000, 0, 0);
         dtable.store(2, desc).unwrap();
 
-        let mut c: DescriptorChain<&GuestMemoryMmap> = DescriptorChain::new(m, vq.start(), 16, 0);
+        let mut c: DescriptorChain<&GuestMemoryMmap> =
+            DescriptorChain::new(m, vq.start(), 16, 0, false);
 
         // create an indirect table with 4 chained descriptors
         let idtable = DescriptorTable::new(m, GuestAddress(0x7000), 4);
@@ -416,6 +442,7 @@ mod tests {
 
     #[test]
     fn test_indirect_descriptor_address_noaligned() {
+        use crate::split_descriptor::Descriptor;
         // Alignment requirements for vring elements start from virtio 1.0,
         // but this is not necessary for address of indirect descriptor.
         let m = &GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
@@ -431,7 +458,8 @@ mod tests {
         );
         dtable.store(0, desc).unwrap();
 
-        let mut c: DescriptorChain<&GuestMemoryMmap> = DescriptorChain::new(m, vq.start(), 16, 0);
+        let mut c: DescriptorChain<&GuestMemoryMmap> =
+            DescriptorChain::new(m, vq.start(), 16, 0, false);
 
         // Create an indirect table with 4 chained descriptors.
         let idtable = DescriptorTable::new(m, GuestAddress(0x7001), 4);
@@ -457,6 +485,7 @@ mod tests {
 
     #[test]
     fn test_indirect_descriptor_err() {
+        use crate::split_descriptor::Descriptor;
         // We are testing here different misconfigurations of the indirect table. For these error
         // case scenarios, the iterator over the descriptor chain won't return a new descriptor.
         {
@@ -469,7 +498,7 @@ mod tests {
             vq.desc_table().store(0, desc).unwrap();
 
             let mut c: DescriptorChain<&GuestMemoryMmap> =
-                DescriptorChain::new(m, vq.start(), 16, 0);
+                DescriptorChain::new(m, vq.start(), 16, 0, false);
 
             assert!(c.next().is_none());
         }
@@ -489,7 +518,7 @@ mod tests {
             vq.desc_table().store(0, desc).unwrap();
 
             let mut c: DescriptorChain<&GuestMemoryMmap> =
-                DescriptorChain::new(m, vq.start(), 16, 0);
+                DescriptorChain::new(m, vq.start(), 16, 0, false);
 
             assert!(c.next().is_none());
         }
@@ -506,7 +535,7 @@ mod tests {
             m.write_obj(desc, GuestAddress(0x1000)).unwrap();
 
             let mut c: DescriptorChain<&GuestMemoryMmap> =
-                DescriptorChain::new(m, vq.start(), 16, 0);
+                DescriptorChain::new(m, vq.start(), 16, 0, false);
             assert!(c.next().is_some());
 
             // But it's not allowed to have an indirect descriptor that points to another indirect
@@ -515,7 +544,7 @@ mod tests {
             m.write_obj(desc, GuestAddress(0x1000)).unwrap();
 
             let mut c: DescriptorChain<&GuestMemoryMmap> =
-                DescriptorChain::new(m, vq.start(), 16, 0);
+                DescriptorChain::new(m, vq.start(), 16, 0, false);
 
             assert!(c.next().is_none());
         }
