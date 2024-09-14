@@ -365,7 +365,7 @@ impl<'a, B: BitmapSlice> io::Write for Writer<'a, B> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Descriptor, Queue, QueueOwnedT, QueueT};
+    use crate::{descriptor::SplitDescriptor as Descriptor, Queue, QueueOwnedT, QueueT};
     use vm_memory::{GuestAddress, GuestMemoryMmap, Le32};
 
     use crate::mock::MockSplitQueue;

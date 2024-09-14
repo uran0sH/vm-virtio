@@ -801,7 +801,7 @@ mod tests {
     use super::*;
     use crate::defs::{DEFAULT_AVAIL_RING_ADDR, DEFAULT_DESC_TABLE_ADDR, DEFAULT_USED_RING_ADDR};
     use crate::mock::MockSplitQueue;
-    use crate::Descriptor;
+    use crate::descriptor::SplitDescriptor as Descriptor;
     use virtio_bindings::bindings::virtio_ring::{
         VRING_DESC_F_NEXT, VRING_DESC_F_WRITE, VRING_USED_F_NO_NOTIFY,
     };
