@@ -2,6 +2,7 @@
 
 use vm_memory::{ByteValued, Le16, Le32, Le64};
 
+pub mod packed;
 pub mod split;
 
 /// A virtio descriptor's layout constraints with C representation.
@@ -30,5 +31,11 @@ impl From<split::Descriptor> for Descriptor {
 impl From<Descriptor> for split::Descriptor {
     fn from(desc: Descriptor) -> split::Descriptor {
         split::Descriptor::new(desc.0.into(), desc.1.into(), desc.2.into(), desc.3.into())
+    }
+}
+
+impl From<Descriptor> for packed::Descriptor {
+    fn from(desc: Descriptor) -> packed::Descriptor {
+        packed::Descriptor::new(desc.0.into(), desc.1.into(), desc.2.into(), desc.3.into())
     }
 }
