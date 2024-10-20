@@ -12,7 +12,13 @@ use vm_memory::{
 };
 
 use crate::defs::{VIRTQ_AVAIL_ELEMENT_SIZE, VIRTQ_AVAIL_RING_HEADER_SIZE};
-use crate::{Descriptor, DescriptorChain, Error, Queue, QueueOwnedT, QueueT, VirtqUsedElem};
+use crate::{
+    desc::{
+        split::{Descriptor as SplitDescriptor, VirtqUsedElem},
+        Descriptor,
+    },
+    DescriptorChain, Error, Queue, QueueOwnedT, QueueT,
+};
 use std::fmt::{self, Debug, Display};
 use virtio_bindings::bindings::virtio_ring::{VRING_DESC_F_INDIRECT, VRING_DESC_F_NEXT};
 
@@ -228,7 +234,7 @@ impl<'a, M: GuestMemory> DescriptorTable<'a, M> {
 
         for (pos, index_value) in indices.iter().copied().enumerate() {
             // Addresses and lens constant for now.
-            let mut desc = Descriptor::new(0x1000, 0x1000, 0, 0);
+            let mut desc = SplitDescriptor::new(0x1000, 0x1000, 0, 0);
 
             // It's not the last descriptor in the chain.
             if pos < indices.len() - 1 {
@@ -237,6 +243,8 @@ impl<'a, M: GuestMemory> DescriptorTable<'a, M> {
             } else {
                 desc.set_flags(0);
             }
+
+            let desc = Descriptor::from(desc);
             self.store(index_value, desc)?;
         }
 
@@ -389,12 +397,13 @@ impl<'a, M: GuestMemory> MockSplitQueue<'a, M> {
         // We just allocate the indirect table and forget about it for now.
         let indirect_addr = self.alloc_indirect_chain(len)?;
 
-        let mut desc = self.desc_table.load(head_idx)?;
+        let desc = self.desc_table.load(head_idx)?;
+        let mut desc = SplitDescriptor::from(desc);
         desc.set_flags(VRING_DESC_F_INDIRECT as u16);
         desc.set_addr(indirect_addr.raw_value());
         desc.set_len(u32::from(len) * size_of::<Descriptor>() as u32);
 
-        self.desc_table.store(head_idx, desc)?;
+        self.desc_table.store(head_idx, Descriptor::from(desc))?;
         self.update_avail_idx(head_idx)
     }
 
@@ -445,6 +454,7 @@ impl<'a, M: GuestMemory> MockSplitQueue<'a, M> {
     pub fn build_desc_chain(&self, descs: &[Descriptor]) -> Result<DescriptorChain<&M>, MockError> {
         let mut modified_descs: Vec<Descriptor> = Vec::with_capacity(descs.len());
         for (idx, desc) in descs.iter().enumerate() {
+            let desc = SplitDescriptor::from(*desc);
             let (flags, next) = if idx == descs.len() - 1 {
                 // Clear the NEXT flag if it was set. The value of the next field of the
                 // Descriptor doesn't matter at this point.
@@ -454,7 +464,12 @@ impl<'a, M: GuestMemory> MockSplitQueue<'a, M> {
                 // descriptor. This ignores any value is actually present in `desc.next`.
                 (desc.flags() | VRING_DESC_F_NEXT as u16, idx as u16 + 1)
             };
-            modified_descs.push(Descriptor::new(desc.addr().0, desc.len(), flags, next));
+            modified_descs.push(Descriptor::from(SplitDescriptor::new(
+                desc.addr().0,
+                desc.len(),
+                flags,
+                next,
+            )));
         }
         self.build_multiple_desc_chains(&modified_descs[..])
     }
@@ -477,7 +492,9 @@ impl<'a, M: GuestMemory> MockSplitQueue<'a, M> {
             let i = idx as u16 + offset;
             self.desc_table().store(i, *desc)?;
 
-            if idx == 0 || descs[idx - 1].flags() & VRING_DESC_F_NEXT as u16 != 1 {
+            if idx == 0
+                || SplitDescriptor::from(descs[idx - 1]).flags() & VRING_DESC_F_NEXT as u16 != 1
+            {
                 // Update the available ring position.
                 self.mem
                     .write_obj(
