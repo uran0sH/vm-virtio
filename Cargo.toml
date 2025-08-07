@@ -15,5 +15,5 @@ lto = true
 codegen-units = 1
 
 [workspace.dependencies]
-vm-memory = "0.16.0"
+vm-memory = { git = "https://github.com/rust-vmm/vm-memory", rev = "b2eaf989de2c3b9146ea7625250472501cd793fd" }
 vmm-sys-util = "0.14.0"
